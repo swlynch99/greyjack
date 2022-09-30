@@ -1,0 +1,17 @@
+[package]
+name = "greyjack"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+async-channel = "1.7.1"
+async-trait = "0.1.57"
+bytes = "1.2.1"
+drop_guard = "0.3.0"
+futures = "0.3.24"
+tokio = { version = "1.21.2", features = ["full"] }
+
+[dev-dependencies]
+console-subscriber = "0.1.8"
