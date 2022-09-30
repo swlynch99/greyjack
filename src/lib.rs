@@ -48,18 +48,19 @@ where
     scope: &'s Scope<'s, 'e>,
     watcher: Watcher<'e>,
   ) -> tokio::runtime::Handle {
-    let rt = tokio::runtime::Builder::new_current_thread()
-      .enable_all()
-      .build()
-      .expect("unable to create worker runtime");
-
-    let handle = rt.handle().clone();
+    let (tx, rx) = crossbeam::channel::bounded(1);
 
     scope.spawn(move || {
+      let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("unable to create worker runtime");
+      tx.send(rt.handle().clone()).unwrap();
+
       rt.block_on(async { watcher.await });
     });
 
-    handle
+    rx.recv().unwrap()
   }
 
   fn drive(&self, mut conn: TcpStream) -> impl Future<Output = ()> + Send {
@@ -150,11 +151,11 @@ where
     let notify = Notify::new();
 
     std::thread::scope(|scope| {
-      let handles = self
-        .workers
-        .iter()
-        .map(|worker| (worker, worker.launch(scope, notify.watch())))
-        .collect::<Vec<_>>();
+      // let handles = self
+      //   .workers
+      //   .iter()
+      //   .map(|worker| (worker, worker.launch(scope, notify.watch())))
+      //   .collect::<Vec<_>>();
 
       std::thread::sleep(Duration::from_secs(1));
 
@@ -172,11 +173,9 @@ where
 
           while let Ok((conn, _)) = listener.accept().await {
             info!("Accepted new connection with fd {}", conn.as_raw_fd());
-            let (worker, handle) = &handles[index];
-            let _ = handle.spawn(worker.drive(conn));
-            index = (index + 1) % handles.len();
+            let _ = tokio::spawn(self.workers[0].drive(conn));
           }
-        })
+        });
     });
   }
 }
