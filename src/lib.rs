@@ -2,16 +2,19 @@
 
 #[macro_use]
 extern crate async_trait;
+#[macro_use]
+extern crate log;
 
 mod iobuf;
 mod notify;
 mod parse;
 mod traits;
 
-use std::thread::{Scope, ScopedJoinHandle};
+use std::future::Future;
+use std::os::unix::prelude::AsRawFd;
+use std::thread::Scope;
 use std::time::Duration;
 
-use async_channel::Receiver;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -44,86 +47,75 @@ where
     &'e self,
     scope: &'s Scope<'s, 'e>,
     watcher: Watcher<'e>,
-    rx: Receiver<TcpStream>,
-  ) -> ScopedJoinHandle<'s, ()> {
+  ) -> tokio::runtime::Handle {
+    let rt = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .expect("unable to create worker runtime");
+
+    let handle = rt.handle().clone();
+
     scope.spawn(move || {
-      tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("unable to create worker runtime")
-        .block_on(self.run(watcher, rx));
-    })
+      rt.block_on(async { watcher.await });
+    });
+
+    handle
   }
 
-  async fn run<'e>(&'e self, mut watcher: Watcher<'e>, rx: Receiver<TcpStream>) {
-    loop {
-      let conn = tokio::select! {
-        () = &mut watcher => return,
-        result = rx.recv() => match result {
-          Ok(conn) => conn,
-          Err(_) => return
-        }
-      };
+  fn drive(&self, mut conn: TcpStream) -> impl Future<Output = ()> + Send {
+    let mut handler = self.builder.build();
+    let parser = self.parser.clone();
 
-      println!("got new connection!");
+    async move {
+      let mut rdbuf = IoBuf::with_capacity(DEFAULT_RDBUF_CAPACITY);
+      let mut wrbuf = Vec::with_capacity(DEFAULT_WRBUF_CAPACITY);
+      let mut unparsed_extra = false;
+      let mut exit = false;
 
-      let handler = self.builder.build();
-      let parser = self.parser.clone();
-
-      tokio::spawn(async move {
-        let parser = parser;
-        let mut handler = handler;
-        let mut conn = conn;
-        let mut rdbuf = IoBuf::with_capacity(DEFAULT_RDBUF_CAPACITY);
-        let mut wrbuf = Vec::with_capacity(DEFAULT_WRBUF_CAPACITY);
-        let mut unparsed_extra = false;
-        let mut exit = false;
-
-        while !exit {
-          if !unparsed_extra || rdbuf.is_empty() {
-            let extra = rdbuf.remainder(DEFAULT_READ_SIZE);
-            match conn.read(extra).await {
-              Ok(count) => rdbuf.advance(count),
-              Err(_) => return,
-            };
-
-            unparsed_extra = true;
-          }
-
-          let consumed = match parser.parse(&rdbuf) {
-            Ok(result) => {
-              let consumed = result.consumed();
-              let request = result.into_inner();
-              let response = handler.execute(request).await;
-              response.compose(&mut wrbuf);
-              exit = response.should_close();
-
-              consumed
-            }
-            Err(e) => match e {
-              ParseError::Fatal => {
-                return;
-              }
-              ParseError::Incomplete => {
-                unparsed_extra = false;
-                0
-              }
-              ParseError::Error { consumed, response } => {
-                response.compose(&mut wrbuf);
-                exit = response.should_close();
-                consumed
-              }
-            },
+      while !exit {
+        if !unparsed_extra || rdbuf.is_empty() {
+          let extra = rdbuf.remainder(DEFAULT_READ_SIZE);
+          match conn.read(extra).await {
+            Ok(count) => rdbuf.advance(count),
+            Err(_) => return,
           };
 
-          rdbuf.consume(consumed);
-          if let Err(_) = conn.write_all(&wrbuf).await {
-            return;
-          }
-
-          wrbuf.clear();
+          unparsed_extra = true;
         }
-      });
+
+        let consumed = match parser.parse(&rdbuf) {
+          Ok(result) => {
+            let consumed = result.consumed();
+            let request = result.into_inner();
+            let response = handler.execute(request).await;
+            response.compose(&mut wrbuf);
+            exit = response.should_close();
+
+            consumed
+          }
+          Err(e) => match e {
+            ParseError::Fatal => {
+              return;
+            }
+            ParseError::Incomplete => {
+              unparsed_extra = false;
+              0
+            }
+            ParseError::Error { consumed, response } => {
+              response.compose(&mut wrbuf);
+              exit = response.should_close();
+              consumed
+            }
+          },
+        };
+
+        rdbuf.consume(consumed);
+        if let Err(_) = conn.write_all(&wrbuf).await {
+          return;
+        }
+
+        wrbuf.clear();
+      }
     }
   }
 }
@@ -158,10 +150,11 @@ where
     let notify = Notify::new();
 
     std::thread::scope(|scope| {
-      let (tx, rx) = async_channel::bounded(1024);
-      for worker in &self.workers {
-        let _ = worker.launch(scope, notify.watch(), rx.clone());
-      }
+      let handles = self
+        .workers
+        .iter()
+        .map(|worker| (worker, worker.launch(scope, notify.watch())))
+        .collect::<Vec<_>>();
 
       std::thread::sleep(Duration::from_secs(1));
 
@@ -171,13 +164,17 @@ where
         .expect("unable to create worker runtime")
         .block_on(async {
           let _guard = drop_guard::guard((), |()| notify.notify());
+          let mut index = 0;
 
           let listener = TcpListener::bind(format!("0.0.0.0:{}", self.port))
             .await
             .expect("Failed to bind to TCP port");
 
           while let Ok((conn, _)) = listener.accept().await {
-            let _ = tx.send(conn).await;
+            info!("Accepted new connection with fd {}", conn.as_raw_fd());
+            let (worker, handle) = &handles[index];
+            let _ = handle.spawn(worker.drive(conn));
+            index = (index + 1) % handles.len();
           }
         })
     });

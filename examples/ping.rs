@@ -71,6 +71,7 @@ impl HandlerBuilder for PingServer {
 
 fn main() {
   console_subscriber::init();
+  env_logger::init_from_env("GREYJACK_LOG");
 
   Server::new(12321)
     .workers(1, Worker::new(PingServer, PingParser))
